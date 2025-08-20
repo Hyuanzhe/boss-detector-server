@@ -21,6 +21,10 @@ from typing import Dict, List, Tuple, Any, Optional
 from flask import Flask, request, jsonify, render_template_string
 from flask_cors import CORS
 
+os.environ['TZ'] = 'Asia/Taipei'
+if hasattr(time, 'tzset'):
+    import time
+    time.tzset()
 # 創建 Flask 應用實例
 app = Flask(__name__)
 CORS(app)
@@ -692,3 +696,4 @@ if __name__ == '__main__':
     # 開發模式
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
+
