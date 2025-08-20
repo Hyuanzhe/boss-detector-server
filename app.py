@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 ===========================================
-  BOSS檢測器 Railway Flask 應用
+  BOSS檢測器 Railway Flask 應用 (PostgreSQL版)
 ===========================================
 作者: @yyv3vnn (Telegram)
-功能: Railway 部署的 Flask API 伺服器
-版本: 5.0.1 (Railway版)
+功能: Railway 部署的 Flask API 伺服器 (支援 PostgreSQL)
+版本: 5.1.0 (PostgreSQL版)
 更新: 2025-08-21
 ===========================================
 """
@@ -18,10 +18,17 @@ import sys
 import json
 import hashlib
 import sqlite3
+import psycopg2
+import psycopg2.extras
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Any, Optional
 from flask import Flask, request, jsonify, render_template_string
 from flask_cors import CORS
+import logging
+
+# 設置日誌
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 os.environ['TZ'] = 'Asia/Taipei'
 
@@ -34,15 +41,98 @@ app.config['SECRET_KEY'] = 'boss_detector_2025_secret_key'
 app.config['JSON_AS_ASCII'] = False
 
 class DatabaseManager:
-    """資料庫管理器"""
+    """資料庫管理器 - 支援 PostgreSQL 和 SQLite"""
     
-    def __init__(self, db_path: str = "boss_detector.db"):
-        self.db_path = db_path
+    def __init__(self):
         self.admin_key = "boss_admin_2025_integrated_key"
-        self.init_database()
+        self.database_url = os.environ.get('DATABASE_URL')
+        
+        if self.database_url:
+            # 使用 PostgreSQL
+            self.use_postgresql = True
+            logger.info("🐘 使用 PostgreSQL 資料庫")
+            self.init_postgresql()
+        else:
+            # 回退到 SQLite
+            self.use_postgresql = False
+            self.db_path = "boss_detector.db"
+            logger.info("🗄️ 使用 SQLite 資料庫")
+            self.init_sqlite()
     
-    def init_database(self):
-        """初始化資料庫"""
+    def get_connection(self):
+        """獲取資料庫連接"""
+        if self.use_postgresql:
+            return psycopg2.connect(self.database_url)
+        else:
+            return sqlite3.connect(self.db_path)
+    
+    def init_postgresql(self):
+        """初始化 PostgreSQL 資料庫"""
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
+            # 序號表
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS serials (
+                    id SERIAL PRIMARY KEY,
+                    serial_key TEXT UNIQUE NOT NULL,
+                    serial_hash TEXT UNIQUE NOT NULL,
+                    machine_id TEXT NOT NULL,
+                    user_name TEXT,
+                    tier TEXT,
+                    created_date TIMESTAMP NOT NULL,
+                    expiry_date TIMESTAMP NOT NULL,
+                    is_active BOOLEAN DEFAULT TRUE,
+                    last_check_time TIMESTAMP,
+                    check_count INTEGER DEFAULT 0,
+                    revoked_date TIMESTAMP,
+                    revoked_reason TEXT,
+                    created_by TEXT DEFAULT 'api',
+                    encryption_type TEXT DEFAULT 'AES+XOR'
+                )
+            ''')
+            
+            # 黑名單表
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS blacklist (
+                    id SERIAL PRIMARY KEY,
+                    machine_id TEXT UNIQUE NOT NULL,
+                    reason TEXT,
+                    created_date TIMESTAMP NOT NULL,
+                    created_by TEXT DEFAULT 'admin'
+                )
+            ''')
+            
+            # 驗證日誌表
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS validation_logs (
+                    id SERIAL PRIMARY KEY,
+                    serial_hash TEXT NOT NULL,
+                    machine_id TEXT NOT NULL,
+                    validation_time TIMESTAMP NOT NULL,
+                    result TEXT NOT NULL,
+                    client_ip TEXT,
+                    user_agent TEXT
+                )
+            ''')
+            
+            # 創建索引
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_serial_hash ON serials(serial_hash)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_machine_id ON serials(machine_id)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_serial_key ON serials(serial_key)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_validation_time ON validation_logs(validation_time)')
+            
+            conn.commit()
+            conn.close()
+            logger.info("✅ PostgreSQL 資料庫初始化成功")
+            
+        except Exception as e:
+            logger.error(f"❌ PostgreSQL 初始化失敗: {e}")
+            raise
+    
+    def init_sqlite(self):
+        """初始化 SQLite 資料庫（回退方案）"""
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
@@ -99,14 +189,27 @@ class DatabaseManager:
             
             conn.commit()
             conn.close()
-            print("✅ 資料庫初始化成功")
+            logger.info("✅ SQLite 資料庫初始化成功")
             
         except Exception as e:
-            print(f"❌ 資料庫初始化失敗: {e}")
+            logger.error(f"❌ SQLite 初始化失敗: {e}")
+            raise
     
     def hash_serial(self, serial_key: str) -> str:
         """生成序號雜湊"""
         return hashlib.sha256(serial_key.encode('utf-8')).hexdigest()
+    
+    def _format_datetime(self, dt) -> str:
+        """格式化日期時間（兼容 PostgreSQL 和 SQLite）"""
+        if isinstance(dt, datetime):
+            return dt.isoformat()
+        return dt
+    
+    def _parse_datetime(self, dt_str) -> datetime:
+        """解析日期時間字符串"""
+        if isinstance(dt_str, datetime):
+            return dt_str
+        return datetime.fromisoformat(dt_str.replace('Z', '+00:00'))
     
     def register_serial(self, serial_key: str, machine_id: str, tier: str, 
                        days: int, user_name: str = "使用者", 
@@ -114,26 +217,43 @@ class DatabaseManager:
         """註冊序號到資料庫"""
         try:
             serial_hash = self.hash_serial(serial_key)
-            created_date = datetime.now().isoformat()
-            expiry_date = (datetime.now() + timedelta(days=days)).isoformat()
+            created_date = datetime.now()
+            expiry_date = created_date + timedelta(days=days)
             
-            conn = sqlite3.connect(self.db_path)
+            conn = self.get_connection()
             cursor = conn.cursor()
             
-            cursor.execute('''
-                INSERT OR REPLACE INTO serials 
-                (serial_key, serial_hash, machine_id, user_name, tier, 
-                 created_date, expiry_date, created_by, encryption_type)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (serial_key, serial_hash, machine_id, user_name, tier, 
-                  created_date, expiry_date, 'api', encryption_type))
+            if self.use_postgresql:
+                cursor.execute('''
+                    INSERT INTO serials 
+                    (serial_key, serial_hash, machine_id, user_name, tier, 
+                     created_date, expiry_date, created_by, encryption_type)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (serial_key) DO UPDATE SET
+                    machine_id = EXCLUDED.machine_id,
+                    user_name = EXCLUDED.user_name,
+                    tier = EXCLUDED.tier,
+                    expiry_date = EXCLUDED.expiry_date,
+                    encryption_type = EXCLUDED.encryption_type
+                ''', (serial_key, serial_hash, machine_id, user_name, tier, 
+                      created_date, expiry_date, 'api', encryption_type))
+            else:
+                cursor.execute('''
+                    INSERT OR REPLACE INTO serials 
+                    (serial_key, serial_hash, machine_id, user_name, tier, 
+                     created_date, expiry_date, created_by, encryption_type)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (serial_key, serial_hash, machine_id, user_name, tier, 
+                      self._format_datetime(created_date), self._format_datetime(expiry_date), 
+                      'api', encryption_type))
             
             conn.commit()
             conn.close()
+            logger.info(f"✅ 序號註冊成功: {serial_hash[:8]}...")
             return True
             
         except Exception as e:
-            print(f"註冊序號失敗: {e}")
+            logger.error(f"❌ 註冊序號失敗: {e}")
             return False
     
     def validate_serial(self, serial_key: str, machine_id: str, 
@@ -141,13 +261,17 @@ class DatabaseManager:
         """驗證序號"""
         try:
             serial_hash = self.hash_serial(serial_key)
-            current_time = datetime.now().isoformat()
+            current_time = datetime.now()
             
-            conn = sqlite3.connect(self.db_path)
+            conn = self.get_connection()
             cursor = conn.cursor()
             
             # 檢查黑名單
-            cursor.execute('SELECT reason FROM blacklist WHERE machine_id = ?', (machine_id,))
+            if self.use_postgresql:
+                cursor.execute('SELECT reason FROM blacklist WHERE machine_id = %s', (machine_id,))
+            else:
+                cursor.execute('SELECT reason FROM blacklist WHERE machine_id = ?', (machine_id,))
+            
             blacklist_result = cursor.fetchone()
             if blacklist_result:
                 self._log_validation(cursor, serial_hash, machine_id, current_time, 
@@ -161,10 +285,16 @@ class DatabaseManager:
                 }
             
             # 檢查序號
-            cursor.execute('''
-                SELECT machine_id, expiry_date, is_active, tier, user_name, check_count
-                FROM serials WHERE serial_hash = ?
-            ''', (serial_hash,))
+            if self.use_postgresql:
+                cursor.execute('''
+                    SELECT machine_id, expiry_date, is_active, tier, user_name, check_count
+                    FROM serials WHERE serial_hash = %s
+                ''', (serial_hash,))
+            else:
+                cursor.execute('''
+                    SELECT machine_id, expiry_date, is_active, tier, user_name, check_count
+                    FROM serials WHERE serial_hash = ?
+                ''', (serial_hash,))
             
             result = cursor.fetchone()
             
@@ -194,8 +324,8 @@ class DatabaseManager:
                 return {'valid': False, 'error': '序號已被停用'}
             
             # 檢查過期時間
-            expiry_dt = datetime.fromisoformat(expiry_date)
-            if datetime.now() > expiry_dt:
+            expiry_dt = self._parse_datetime(expiry_date)
+            if current_time > expiry_dt:
                 self._log_validation(cursor, serial_hash, machine_id, current_time, 
                                    'EXPIRED', client_ip)
                 conn.commit()
@@ -203,11 +333,18 @@ class DatabaseManager:
                 return {'valid': False, 'error': '序號已過期', 'expired': True}
             
             # 更新檢查時間和次數
-            cursor.execute('''
-                UPDATE serials 
-                SET last_check_time = ?, check_count = check_count + 1 
-                WHERE serial_hash = ?
-            ''', (current_time, serial_hash))
+            if self.use_postgresql:
+                cursor.execute('''
+                    UPDATE serials 
+                    SET last_check_time = %s, check_count = check_count + 1 
+                    WHERE serial_hash = %s
+                ''', (current_time, serial_hash))
+            else:
+                cursor.execute('''
+                    UPDATE serials 
+                    SET last_check_time = ?, check_count = check_count + 1 
+                    WHERE serial_hash = ?
+                ''', (self._format_datetime(current_time), serial_hash))
             
             self._log_validation(cursor, serial_hash, machine_id, current_time, 
                                'VALID', client_ip)
@@ -215,43 +352,54 @@ class DatabaseManager:
             conn.commit()
             conn.close()
             
-            remaining_days = (expiry_dt - datetime.now()).days
+            remaining_days = (expiry_dt - current_time).days
             
             return {
                 'valid': True,
                 'tier': tier,
                 'user_name': user_name,
-                'expiry_date': expiry_date,
+                'expiry_date': self._format_datetime(expiry_dt),
                 'remaining_days': remaining_days,
-                'check_count': check_count + 1
+                'check_count': (check_count or 0) + 1
             }
             
         except Exception as e:
+            logger.error(f"❌ 驗證過程錯誤: {e}")
             return {'valid': False, 'error': f'驗證過程錯誤: {str(e)}'}
     
     def revoke_serial(self, serial_key: str, reason: str = "管理員停用") -> bool:
         """停用序號"""
         try:
             serial_hash = self.hash_serial(serial_key)
-            revoked_date = datetime.now().isoformat()
+            revoked_date = datetime.now()
             
-            conn = sqlite3.connect(self.db_path)
+            conn = self.get_connection()
             cursor = conn.cursor()
             
-            cursor.execute('''
-                UPDATE serials 
-                SET is_active = 0, revoked_date = ?, revoked_reason = ?
-                WHERE serial_hash = ?
-            ''', (revoked_date, reason, serial_hash))
+            if self.use_postgresql:
+                cursor.execute('''
+                    UPDATE serials 
+                    SET is_active = FALSE, revoked_date = %s, revoked_reason = %s
+                    WHERE serial_hash = %s
+                ''', (revoked_date, reason, serial_hash))
+            else:
+                cursor.execute('''
+                    UPDATE serials 
+                    SET is_active = 0, revoked_date = ?, revoked_reason = ?
+                    WHERE serial_hash = ?
+                ''', (self._format_datetime(revoked_date), reason, serial_hash))
             
             success = cursor.rowcount > 0
             conn.commit()
             conn.close()
             
+            if success:
+                logger.info(f"✅ 序號停用成功: {serial_hash[:8]}...")
+            
             return success
             
         except Exception as e:
-            print(f"停用序號失敗: {e}")
+            logger.error(f"❌ 停用序號失敗: {e}")
             return False
     
     def restore_serial(self, serial_key: str) -> bool:
@@ -259,75 +407,109 @@ class DatabaseManager:
         try:
             serial_hash = self.hash_serial(serial_key)
             
-            conn = sqlite3.connect(self.db_path)
+            conn = self.get_connection()
             cursor = conn.cursor()
             
-            cursor.execute('''
-                UPDATE serials 
-                SET is_active = 1, revoked_date = NULL, revoked_reason = NULL
-                WHERE serial_hash = ?
-            ''', (serial_hash,))
+            if self.use_postgresql:
+                cursor.execute('''
+                    UPDATE serials 
+                    SET is_active = TRUE, revoked_date = NULL, revoked_reason = NULL
+                    WHERE serial_hash = %s
+                ''', (serial_hash,))
+            else:
+                cursor.execute('''
+                    UPDATE serials 
+                    SET is_active = 1, revoked_date = NULL, revoked_reason = NULL
+                    WHERE serial_hash = ?
+                ''', (serial_hash,))
             
             success = cursor.rowcount > 0
             conn.commit()
             conn.close()
             
+            if success:
+                logger.info(f"✅ 序號恢復成功: {serial_hash[:8]}...")
+            
             return success
             
         except Exception as e:
-            print(f"恢復序號失敗: {e}")
+            logger.error(f"❌ 恢復序號失敗: {e}")
             return False
     
     def add_to_blacklist(self, machine_id: str, reason: str = "違規使用") -> bool:
         """添加到黑名單"""
         try:
-            created_date = datetime.now().isoformat()
+            created_date = datetime.now()
             
-            conn = sqlite3.connect(self.db_path)
+            conn = self.get_connection()
             cursor = conn.cursor()
             
-            cursor.execute('''
-                INSERT OR REPLACE INTO blacklist 
-                (machine_id, reason, created_date)
-                VALUES (?, ?, ?)
-            ''', (machine_id, reason, created_date))
-            
-            # 同時停用該機器的所有序號
-            cursor.execute('''
-                UPDATE serials 
-                SET is_active = 0, revoked_date = ?, revoked_reason = ?
-                WHERE machine_id = ? AND is_active = 1
-            ''', (created_date, f"黑名單自動停用: {reason}", machine_id))
+            if self.use_postgresql:
+                cursor.execute('''
+                    INSERT INTO blacklist 
+                    (machine_id, reason, created_date)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (machine_id) DO UPDATE SET
+                    reason = EXCLUDED.reason,
+                    created_date = EXCLUDED.created_date
+                ''', (machine_id, reason, created_date))
+                
+                # 同時停用該機器的所有序號
+                cursor.execute('''
+                    UPDATE serials 
+                    SET is_active = FALSE, revoked_date = %s, revoked_reason = %s
+                    WHERE machine_id = %s AND is_active = TRUE
+                ''', (created_date, f"黑名單自動停用: {reason}", machine_id))
+            else:
+                cursor.execute('''
+                    INSERT OR REPLACE INTO blacklist 
+                    (machine_id, reason, created_date)
+                    VALUES (?, ?, ?)
+                ''', (machine_id, reason, self._format_datetime(created_date)))
+                
+                cursor.execute('''
+                    UPDATE serials 
+                    SET is_active = 0, revoked_date = ?, revoked_reason = ?
+                    WHERE machine_id = ? AND is_active = 1
+                ''', (self._format_datetime(created_date), f"黑名單自動停用: {reason}", machine_id))
             
             conn.commit()
             conn.close()
+            logger.info(f"✅ 黑名單添加成功: {machine_id}")
             return True
             
         except Exception as e:
-            print(f"添加黑名單失敗: {e}")
+            logger.error(f"❌ 添加黑名單失敗: {e}")
             return False
     
     def remove_from_blacklist(self, machine_id: str) -> bool:
         """從黑名單移除"""
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = self.get_connection()
             cursor = conn.cursor()
             
-            cursor.execute('DELETE FROM blacklist WHERE machine_id = ?', (machine_id,))
-            success = cursor.rowcount > 0
+            if self.use_postgresql:
+                cursor.execute('DELETE FROM blacklist WHERE machine_id = %s', (machine_id,))
+            else:
+                cursor.execute('DELETE FROM blacklist WHERE machine_id = ?', (machine_id,))
             
+            success = cursor.rowcount > 0
             conn.commit()
             conn.close()
+            
+            if success:
+                logger.info(f"✅ 黑名單移除成功: {machine_id}")
+            
             return success
             
         except Exception as e:
-            print(f"移除黑名單失敗: {e}")
+            logger.error(f"❌ 移除黑名單失敗: {e}")
             return False
     
     def get_statistics(self) -> Dict[str, Any]:
         """獲取統計資訊"""
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = self.get_connection()
             cursor = conn.cursor()
             
             # 總序號數
@@ -335,7 +517,10 @@ class DatabaseManager:
             total_serials = cursor.fetchone()[0]
             
             # 活躍序號數
-            cursor.execute('SELECT COUNT(*) FROM serials WHERE is_active = 1')
+            if self.use_postgresql:
+                cursor.execute('SELECT COUNT(*) FROM serials WHERE is_active = TRUE')
+            else:
+                cursor.execute('SELECT COUNT(*) FROM serials WHERE is_active = 1')
             active_serials = cursor.fetchone()[0]
             
             # 黑名單數
@@ -343,8 +528,11 @@ class DatabaseManager:
             blacklist_count = cursor.fetchone()[0]
             
             # 今日驗證數
-            today = datetime.now().date().isoformat()
-            cursor.execute('SELECT COUNT(*) FROM validation_logs WHERE DATE(validation_time) = ?', (today,))
+            if self.use_postgresql:
+                cursor.execute("SELECT COUNT(*) FROM validation_logs WHERE DATE(validation_time) = CURRENT_DATE")
+            else:
+                today = datetime.now().date().isoformat()
+                cursor.execute('SELECT COUNT(*) FROM validation_logs WHERE DATE(validation_time) = ?', (today,))
             today_validations = cursor.fetchone()[0]
             
             conn.close()
@@ -354,24 +542,40 @@ class DatabaseManager:
                 'active_serials': active_serials,
                 'revoked_serials': total_serials - active_serials,
                 'blacklist_count': blacklist_count,
-                'today_validations': today_validations
+                'today_validations': today_validations,
+                'database_type': 'PostgreSQL' if self.use_postgresql else 'SQLite'
             }
             
         except Exception as e:
-            print(f"獲取統計失敗: {e}")
-            return {}
+            logger.error(f"❌ 獲取統計失敗: {e}")
+            return {'database_type': 'PostgreSQL' if self.use_postgresql else 'SQLite'}
     
     def _log_validation(self, cursor, serial_hash: str, machine_id: str, 
-                       validation_time: str, result: str, client_ip: str):
+                       validation_time: datetime, result: str, client_ip: str):
         """記錄驗證日誌"""
-        cursor.execute('''
-            INSERT INTO validation_logs 
-            (serial_hash, machine_id, validation_time, result, client_ip)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (serial_hash, machine_id, validation_time, result, client_ip))
+        try:
+            if self.use_postgresql:
+                cursor.execute('''
+                    INSERT INTO validation_logs 
+                    (serial_hash, machine_id, validation_time, result, client_ip)
+                    VALUES (%s, %s, %s, %s, %s)
+                ''', (serial_hash, machine_id, validation_time, result, client_ip))
+            else:
+                cursor.execute('''
+                    INSERT INTO validation_logs 
+                    (serial_hash, machine_id, validation_time, result, client_ip)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (serial_hash, machine_id, self._format_datetime(validation_time), result, client_ip))
+        except Exception as e:
+            logger.error(f"❌ 記錄驗證日誌失敗: {e}")
 
 # 初始化資料庫管理器
-db_manager = DatabaseManager()
+try:
+    db_manager = DatabaseManager()
+    logger.info("✅ 資料庫管理器初始化成功")
+except Exception as e:
+    logger.error(f"❌ 資料庫管理器初始化失敗: {e}")
+    sys.exit(1)
 
 # API 路由
 @app.route('/')
@@ -389,9 +593,11 @@ def home():
             .container { max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; }
             .status { padding: 15px; margin: 10px 0; border-radius: 5px; }
             .success { background: #d4edda; color: #155724; }
+            .info { background: #d1ecf1; color: #0c5460; }
             table { width: 100%; border-collapse: collapse; margin: 20px 0; }
             th, td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
             th { background-color: #f2f2f2; }
+            .db-type { font-weight: bold; color: #007bff; }
         </style>
     </head>
     <body>
@@ -401,10 +607,21 @@ def home():
                 ✅ 伺服器運行正常 - {{ current_time }}
             </div>
             
+            {% if stats.database_type == 'PostgreSQL' %}
+            <div class="status info">
+                🐘 <span class="db-type">PostgreSQL</span> 資料庫已連接 - 數據永久保存
+            </div>
+            {% else %}
+            <div class="status info">
+                🗄️ <span class="db-type">SQLite</span> 資料庫 - 建議使用 PostgreSQL 以確保數據持久性
+            </div>
+            {% endif %}
+            
             <h2>📊 伺服器狀態</h2>
             <table>
                 <tr><th>項目</th><th>狀態</th></tr>
                 <tr><td>部署平台</td><td>Railway.app</td></tr>
+                <tr><td>資料庫類型</td><td class="db-type">{{ stats.database_type }}</td></tr>
                 <tr><td>總序號數</td><td>{{ stats.total_serials }}</td></tr>
                 <tr><td>活躍序號</td><td>{{ stats.active_serials }}</td></tr>
                 <tr><td>停用序號</td><td>{{ stats.revoked_serials }}</td></tr>
@@ -431,12 +648,14 @@ def home():
 @app.route('/api/health')
 def health_check():
     """健康檢查"""
+    stats = db_manager.get_statistics()
     return jsonify({
         'status': 'healthy',
         'server': 'BOSS檢測器 Railway 驗證伺服器',
-        'version': '5.0.1',
+        'version': '5.1.0',
         'timestamp': datetime.now().isoformat(),
-        'database': 'connected'
+        'database': stats.get('database_type', 'Unknown'),
+        'stats': stats
     })
 
 @app.route('/api/validate', methods=['POST'])
@@ -459,6 +678,7 @@ def validate_serial():
         return jsonify(result)
         
     except Exception as e:
+        logger.error(f"❌ 驗證API錯誤: {e}")
         return jsonify({'valid': False, 'error': f'驗證失敗: {str(e)}'}), 500
 
 @app.route('/api/register', methods=['POST'])
@@ -491,6 +711,7 @@ def register_serial():
         })
         
     except Exception as e:
+        logger.error(f"❌ 註冊API錯誤: {e}")
         return jsonify({'success': False, 'error': f'註冊失敗: {str(e)}'}), 500
 
 @app.route('/api/revoke', methods=['POST'])
@@ -514,6 +735,7 @@ def revoke_serial():
         })
         
     except Exception as e:
+        logger.error(f"❌ 停用API錯誤: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/restore', methods=['POST'])
@@ -535,6 +757,7 @@ def restore_serial():
         })
         
     except Exception as e:
+        logger.error(f"❌ 恢復API錯誤: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/blacklist', methods=['POST'])
@@ -558,6 +781,7 @@ def add_blacklist():
         })
         
     except Exception as e:
+        logger.error(f"❌ 黑名單API錯誤: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/blacklist/remove', methods=['POST'])
@@ -579,6 +803,7 @@ def remove_blacklist():
         })
         
     except Exception as e:
+        logger.error(f"❌ 移除黑名單API錯誤: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/stats')
@@ -588,6 +813,7 @@ def get_stats():
         stats = db_manager.get_statistics()
         return jsonify(stats)
     except Exception as e:
+        logger.error(f"❌ 統計API錯誤: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/blacklist/check', methods=['POST'])
@@ -600,10 +826,14 @@ def check_blacklist():
         if not machine_id:
             return jsonify({'blacklisted': False, 'error': '缺少機器ID'}), 400
         
-        conn = sqlite3.connect(db_manager.db_path)
+        conn = db_manager.get_connection()
         cursor = conn.cursor()
         
-        cursor.execute('SELECT reason, created_date FROM blacklist WHERE machine_id = ?', (machine_id,))
+        if db_manager.use_postgresql:
+            cursor.execute('SELECT reason, created_date FROM blacklist WHERE machine_id = %s', (machine_id,))
+        else:
+            cursor.execute('SELECT reason, created_date FROM blacklist WHERE machine_id = ?', (machine_id,))
+        
         result = cursor.fetchone()
         conn.close()
         
@@ -612,13 +842,14 @@ def check_blacklist():
                 'blacklisted': True,
                 'info': {
                     'reason': result[0],
-                    'created_date': result[1]
+                    'created_date': db_manager._format_datetime(result[1])
                 }
             })
         else:
             return jsonify({'blacklisted': False})
             
     except Exception as e:
+        logger.error(f"❌ 檢查黑名單API錯誤: {e}")
         return jsonify({'blacklisted': False, 'error': str(e)}), 500
 
 @app.route('/api/serial/status', methods=['POST'])
@@ -637,13 +868,19 @@ def check_serial_status():
         
         serial_hash = db_manager.hash_serial(serial_key)
         
-        conn = sqlite3.connect(db_manager.db_path)
+        conn = db_manager.get_connection()
         cursor = conn.cursor()
         
-        cursor.execute('''
-            SELECT machine_id, user_name, tier, is_active, revoked_date, revoked_reason
-            FROM serials WHERE serial_hash = ?
-        ''', (serial_hash,))
+        if db_manager.use_postgresql:
+            cursor.execute('''
+                SELECT machine_id, user_name, tier, is_active, revoked_date, revoked_reason
+                FROM serials WHERE serial_hash = %s
+            ''', (serial_hash,))
+        else:
+            cursor.execute('''
+                SELECT machine_id, user_name, tier, is_active, revoked_date, revoked_reason
+                FROM serials WHERE serial_hash = ?
+            ''', (serial_hash,))
         
         result = cursor.fetchone()
         conn.close()
@@ -657,7 +894,7 @@ def check_serial_status():
                     'machine_id': machine_id,
                     'user_name': user_name,
                     'tier': tier,
-                    'revoked_date': revoked_date,
+                    'revoked_date': db_manager._format_datetime(revoked_date) if revoked_date else None,
                     'revoked_reason': revoked_reason
                 }
             })
@@ -665,6 +902,7 @@ def check_serial_status():
             return jsonify({'found': False})
             
     except Exception as e:
+        logger.error(f"❌ 檢查序號狀態API錯誤: {e}")
         return jsonify({'found': False, 'error': str(e)}), 500
 
 # 錯誤處理
@@ -674,11 +912,13 @@ def not_found(error):
 
 @app.errorhandler(500)
 def internal_error(error):
+    logger.error(f"❌ 伺服器內部錯誤: {error}")
     return jsonify({'error': '伺服器內部錯誤'}), 500
 
 # 主程式入口點
 if __name__ == '__main__':
     print("🚀 啟動 BOSS檢測器 Railway 驗證伺服器...")
+    print(f"📍 資料庫類型: {'PostgreSQL' if db_manager.use_postgresql else 'SQLite'}")
     print("📡 可用的 API 端點:")
     print("  GET  / - 首頁")
     print("  GET  /api/health - 健康檢查")
@@ -696,6 +936,3 @@ if __name__ == '__main__':
     # 開發模式
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
-
-
-
