@@ -12,6 +12,8 @@
 """
 
 import os
+import datetime
+import pytz
 import sys
 import json
 import hashlib
@@ -20,6 +22,8 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Any, Optional
 from flask import Flask, request, jsonify, render_template_string
 from flask_cors import CORS
+
+os.environ['TZ'] = 'Asia/Taipei'
 
 # 創建 Flask 應用實例
 app = Flask(__name__)
@@ -692,5 +696,6 @@ if __name__ == '__main__':
     # 開發模式
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
+
 
 
