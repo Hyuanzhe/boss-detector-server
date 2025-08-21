@@ -246,7 +246,352 @@ class DatabaseManager:
             print(f"❌ SQLite 初始化失敗: {e}")
             logger.error(f"❌ SQLite 初始化失敗: {e}")
             raise
+    # 在您的 app.py 中添加以下缺失的 API 端點
+
+    @app.route('/api/revoke', methods=['POST'])
+    def revoke_serial():
+        """停用序號"""
+        try:
+            data = request.get_json()
+            if not data:
+                return jsonify({'success': False, 'error': '無效的請求資料'}), 400
+            
+            admin_key = data.get('admin_key')
+            if admin_key != db_manager.admin_key:
+                return jsonify({'success': False, 'error': '管理員認證失敗'}), 403
+            
+            serial_key = data.get('serial_key')
+            reason = data.get('reason', '管理員停用')
+            
+            if not serial_key:
+                return jsonify({'success': False, 'error': '缺少序號'}), 400
+            
+            success = db_manager.revoke_serial(serial_key, reason)
+            
+            return jsonify({
+                'success': success,
+                'message': '序號停用成功' if success else '序號停用失敗'
+            })
+            
+        except Exception as e:
+            logger.error(f"❌ 停用API錯誤: {e}")
+            return jsonify({'success': False, 'error': str(e)}), 500
     
+    @app.route('/api/restore', methods=['POST'])
+    def restore_serial():
+        """恢復序號"""
+        try:
+            data = request.get_json()
+            if not data:
+                return jsonify({'success': False, 'error': '無效的請求資料'}), 400
+            
+            admin_key = data.get('admin_key')
+            if admin_key != db_manager.admin_key:
+                return jsonify({'success': False, 'error': '管理員認證失敗'}), 403
+            
+            serial_key = data.get('serial_key')
+            if not serial_key:
+                return jsonify({'success': False, 'error': '缺少序號'}), 400
+            
+            success = db_manager.restore_serial(serial_key)
+            
+            return jsonify({
+                'success': success,
+                'message': '序號恢復成功' if success else '序號恢復失敗'
+            })
+            
+        except Exception as e:
+            logger.error(f"❌ 恢復API錯誤: {e}")
+            return jsonify({'success': False, 'error': str(e)}), 500
+    
+    @app.route('/api/blacklist', methods=['POST'])
+    def add_blacklist():
+        """添加黑名單"""
+        try:
+            data = request.get_json()
+            if not data:
+                return jsonify({'success': False, 'error': '無效的請求資料'}), 400
+            
+            admin_key = data.get('admin_key')
+            if admin_key != db_manager.admin_key:
+                return jsonify({'success': False, 'error': '管理員認證失敗'}), 403
+            
+            machine_id = data.get('machine_id')
+            reason = data.get('reason', '違規使用')
+            
+            if not machine_id:
+                return jsonify({'success': False, 'error': '缺少機器ID'}), 400
+            
+            success = db_manager.add_to_blacklist(machine_id, reason)
+            
+            return jsonify({
+                'success': success,
+                'message': '黑名單添加成功' if success else '黑名單添加失敗'
+            })
+            
+        except Exception as e:
+            logger.error(f"❌ 黑名單API錯誤: {e}")
+            return jsonify({'success': False, 'error': str(e)}), 500
+    
+    @app.route('/api/blacklist/remove', methods=['POST'])
+    def remove_blacklist():
+        """移除黑名單"""
+        try:
+            data = request.get_json()
+            if not data:
+                return jsonify({'success': False, 'error': '無效的請求資料'}), 400
+            
+            admin_key = data.get('admin_key')
+            if admin_key != db_manager.admin_key:
+                return jsonify({'success': False, 'error': '管理員認證失敗'}), 403
+            
+            machine_id = data.get('machine_id')
+            if not machine_id:
+                return jsonify({'success': False, 'error': '缺少機器ID'}), 400
+            
+            success = db_manager.remove_from_blacklist(machine_id)
+            
+            return jsonify({
+                'success': success,
+                'message': '黑名單移除成功' if success else '黑名單移除失敗'
+            })
+            
+        except Exception as e:
+            logger.error(f"❌ 移除黑名單API錯誤: {e}")
+            return jsonify({'success': False, 'error': str(e)}), 500
+    
+    @app.route('/api/blacklist/check', methods=['POST'])
+    def check_blacklist():
+        """檢查黑名單狀態"""
+        try:
+            data = request.get_json()
+            if not data:
+                return jsonify({'blacklisted': False, 'error': '無效的請求資料'}), 400
+            
+            machine_id = data.get('machine_id')
+            if not machine_id:
+                return jsonify({'blacklisted': False, 'error': '缺少機器ID'}), 400
+            
+            conn = db_manager.get_connection()
+            cursor = conn.cursor()
+            
+            if db_manager.use_postgresql:
+                cursor.execute('SELECT reason, created_date FROM blacklist WHERE machine_id = %s', (machine_id,))
+            else:
+                cursor.execute('SELECT reason, created_date FROM blacklist WHERE machine_id = ?', (machine_id,))
+            
+            result = cursor.fetchone()
+            conn.close()
+            
+            if result:
+                return jsonify({
+                    'blacklisted': True,
+                    'info': {
+                        'reason': result[0],
+                        'created_date': db_manager._format_datetime(result[1])
+                    }
+                })
+            else:
+                return jsonify({'blacklisted': False})
+                
+        except Exception as e:
+            logger.error(f"❌ 檢查黑名單API錯誤: {e}")
+            return jsonify({'blacklisted': False, 'error': str(e)}), 500
+    
+    @app.route('/api/serial/status', methods=['POST'])
+    def check_serial_status():
+        """檢查序號狀態"""
+        try:
+            data = request.get_json()
+            if not data:
+                return jsonify({'found': False, 'error': '無效的請求資料'}), 400
+            
+            admin_key = data.get('admin_key')
+            if admin_key != db_manager.admin_key:
+                return jsonify({'found': False, 'error': '管理員認證失敗'}), 403
+            
+            serial_key = data.get('serial_key')
+            if not serial_key:
+                return jsonify({'found': False, 'error': '缺少序號'}), 400
+            
+            serial_hash = db_manager.hash_serial(serial_key)
+            
+            conn = db_manager.get_connection()
+            cursor = conn.cursor()
+            
+            if db_manager.use_postgresql:
+                cursor.execute('''
+                    SELECT machine_id, user_name, tier, is_active, revoked_date, revoked_reason
+                    FROM serials WHERE serial_hash = %s
+                ''', (serial_hash,))
+            else:
+                cursor.execute('''
+                    SELECT machine_id, user_name, tier, is_active, revoked_date, revoked_reason
+                    FROM serials WHERE serial_hash = ?
+                ''', (serial_hash,))
+            
+            result = cursor.fetchone()
+            conn.close()
+            
+            if result:
+                machine_id, user_name, tier, is_active, revoked_date, revoked_reason = result
+                return jsonify({
+                    'found': True,
+                    'is_active': bool(is_active),
+                    'info': {
+                        'machine_id': machine_id,
+                        'user_name': user_name,
+                        'tier': tier,
+                        'revoked_date': db_manager._format_datetime(revoked_date) if revoked_date else None,
+                        'revoked_reason': revoked_reason
+                    }
+                })
+            else:
+                return jsonify({'found': False})
+                
+        except Exception as e:
+            logger.error(f"❌ 檢查序號狀態API錯誤: {e}")
+            return jsonify({'found': False, 'error': str(e)}), 500
+    
+    # 同時需要添加對應的資料庫方法（如果還沒有的話）
+    def revoke_serial(self, serial_key: str, reason: str = "管理員停用") -> bool:
+        """停用序號"""
+        try:
+            serial_hash = self.hash_serial(serial_key)
+            revoked_date = datetime.now()
+            
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
+            if self.use_postgresql:
+                cursor.execute('''
+                    UPDATE serials 
+                    SET is_active = FALSE, revoked_date = %s, revoked_reason = %s
+                    WHERE serial_hash = %s
+                ''', (revoked_date, reason, serial_hash))
+            else:
+                cursor.execute('''
+                    UPDATE serials 
+                    SET is_active = 0, revoked_date = ?, revoked_reason = ?
+                    WHERE serial_hash = ?
+                ''', (self._format_datetime(revoked_date), reason, serial_hash))
+            
+            success = cursor.rowcount > 0
+            conn.commit()
+            conn.close()
+            
+            if success:
+                logger.info(f"✅ 序號停用成功: {serial_hash[:8]}...")
+            
+            return success
+            
+        except Exception as e:
+            logger.error(f"❌ 停用序號失敗: {e}")
+            return False
+    
+    def restore_serial(self, serial_key: str) -> bool:
+        """恢復序號"""
+        try:
+            serial_hash = self.hash_serial(serial_key)
+            
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
+            if self.use_postgresql:
+                cursor.execute('''
+                    UPDATE serials 
+                    SET is_active = TRUE, revoked_date = NULL, revoked_reason = NULL
+                    WHERE serial_hash = %s
+                ''', (serial_hash,))
+            else:
+                cursor.execute('''
+                    UPDATE serials 
+                    SET is_active = 1, revoked_date = NULL, revoked_reason = NULL
+                    WHERE serial_hash = ?
+                ''', (serial_hash,))
+            
+            success = cursor.rowcount > 0
+            conn.commit()
+            conn.close()
+            
+            if success:
+                logger.info(f"✅ 序號恢復成功: {serial_hash[:8]}...")
+            
+            return success
+            
+        except Exception as e:
+            logger.error(f"❌ 恢復序號失敗: {e}")
+            return False
+    
+    def add_to_blacklist(self, machine_id: str, reason: str = "違規使用") -> bool:
+        """添加到黑名單"""
+        try:
+            created_date = datetime.now()
+            
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
+            if self.use_postgresql:
+                cursor.execute('''
+                    INSERT INTO blacklist 
+                    (machine_id, reason, created_date)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (machine_id) DO UPDATE SET
+                    reason = EXCLUDED.reason,
+                    created_date = EXCLUDED.created_date
+                ''', (machine_id, reason, created_date))
+                
+                # 同時停用該機器的所有序號
+                cursor.execute('''
+                    UPDATE serials 
+                    SET is_active = FALSE, revoked_date = %s, revoked_reason = %s
+                    WHERE machine_id = %s AND is_active = TRUE
+                ''', (created_date, f"黑名單自動停用: {reason}", machine_id))
+            else:
+                cursor.execute('''
+                    INSERT OR REPLACE INTO blacklist 
+                    (machine_id, reason, created_date)
+                    VALUES (?, ?, ?)
+                ''', (machine_id, reason, self._format_datetime(created_date)))
+                
+                cursor.execute('''
+                    UPDATE serials 
+                    SET is_active = 0, revoked_date = ?, revoked_reason = ?
+                    WHERE machine_id = ? AND is_active = 1
+                ''', (self._format_datetime(created_date), f"黑名單自動停用: {reason}", machine_id))
+            
+            conn.commit()
+            conn.close()
+            logger.info(f"✅ 黑名單添加成功: {machine_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ 添加黑名單失敗: {e}")
+            return False
+
+    def remove_from_blacklist(self, machine_id: str) -> bool:
+        """從黑名單移除"""
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
+            if self.use_postgresql:
+                cursor.execute('DELETE FROM blacklist WHERE machine_id = %s', (machine_id,))
+            else:
+                cursor.execute('DELETE FROM blacklist WHERE machine_id = ?', (machine_id,))
+            
+            success = cursor.rowcount > 0
+            conn.commit()
+            conn.close()
+            
+            if success:
+                logger.info(f"✅ 黑名單移除成功: {machine_id}")
+            
+            return success
+            
+        except Exception as e:
+            logger.error(f"❌ 移除黑名單失敗: {e}")
+            return False
     def hash_serial(self, serial_key: str) -> str:
         """生成序號雜湊"""
         return hashlib.sha256(serial_key.encode('utf-8')).hexdigest()
@@ -682,3 +1027,4 @@ if __name__ == '__main__':
     # 開發模式
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
+
