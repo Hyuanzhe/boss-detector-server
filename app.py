@@ -6,7 +6,7 @@
 ===========================================
 作者: @yyv3vnn (Telegram)
 功能: Railway 部署的 Flask API 伺服器 (支援 PostgreSQL)
-版本: 5.1.0 (PostgreSQL版)
+版本: 5.1.1 (修復版)
 更新: 2025-08-21
 ===========================================
 """
@@ -18,13 +18,35 @@ import sys
 import json
 import hashlib
 import sqlite3
-import psycopg2
-import psycopg2.extras
+import logging
+
+# 在導入其他模組前，先檢查和設置環境變量
+print(f"🔍 DATABASE_URL 環境變量: {bool(os.environ.get('DATABASE_URL'))}")
+database_url = os.environ.get('DATABASE_URL')
+if database_url:
+    print(f"✅ 找到 DATABASE_URL: {database_url[:50]}...")
+else:
+    print("❌ 未找到 DATABASE_URL 環境變量")
+
+# 嘗試導入 psycopg2
+PSYCOPG2_AVAILABLE = False
+try:
+    import psycopg2
+    import psycopg2.extras
+    print("✅ psycopg2 導入成功")
+    PSYCOPG2_AVAILABLE = True
+except ImportError as e:
+    print(f"❌ psycopg2 導入失敗: {e}")
+    print("🔄 將使用 SQLite 作為回退")
+    PSYCOPG2_AVAILABLE = False
+except Exception as e:
+    print(f"❌ psycopg2 未知錯誤: {e}")
+    PSYCOPG2_AVAILABLE = False
+
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Any, Optional
 from flask import Flask, request, jsonify, render_template_string
 from flask_cors import CORS
-import logging
 
 # 設置日誌
 logging.basicConfig(level=logging.INFO)
@@ -47,16 +69,39 @@ class DatabaseManager:
         self.admin_key = "boss_admin_2025_integrated_key"
         self.database_url = os.environ.get('DATABASE_URL')
         
-        if self.database_url:
-            # 使用 PostgreSQL
-            self.use_postgresql = True
-            logger.info("🐘 使用 PostgreSQL 資料庫")
-            self.init_postgresql()
+        print(f"🔍 初始化資料庫管理器...")
+        print(f"   DATABASE_URL 存在: {bool(self.database_url)}")
+        print(f"   psycopg2 可用: {PSYCOPG2_AVAILABLE}")
+        
+        # 決定使用哪種資料庫
+        if self.database_url and PSYCOPG2_AVAILABLE:
+            print("🧪 測試 PostgreSQL 連接...")
+            try:
+                # 測試連接
+                test_conn = psycopg2.connect(self.database_url)
+                test_conn.close()
+                print("✅ PostgreSQL 連接測試成功")
+                
+                self.use_postgresql = True
+                logger.info("🐘 使用 PostgreSQL 資料庫")
+                self.init_postgresql()
+            except Exception as e:
+                print(f"❌ PostgreSQL 連接失敗: {e}")
+                print("🔄 回退到 SQLite")
+                self.use_postgresql = False
+                self.db_path = "boss_detector.db"
+                logger.info("🗄️ 使用 SQLite 資料庫 (PostgreSQL 連接失敗)")
+                self.init_sqlite()
         else:
             # 回退到 SQLite
             self.use_postgresql = False
             self.db_path = "boss_detector.db"
-            logger.info("🗄️ 使用 SQLite 資料庫")
+            if not self.database_url:
+                logger.info("🗄️ 使用 SQLite 資料庫 (未找到 DATABASE_URL)")
+                print("📝 原因: 未找到 DATABASE_URL 環境變量")
+            elif not PSYCOPG2_AVAILABLE:
+                logger.info("🗄️ 使用 SQLite 資料庫 (psycopg2 不可用)")
+                print("📝 原因: psycopg2 庫不可用")
             self.init_sqlite()
     
     def get_connection(self):
@@ -71,6 +116,8 @@ class DatabaseManager:
         try:
             conn = self.get_connection()
             cursor = conn.cursor()
+            
+            print("🔧 創建 PostgreSQL 表...")
             
             # 序號表
             cursor.execute('''
@@ -125,15 +172,18 @@ class DatabaseManager:
             
             conn.commit()
             conn.close()
+            print("✅ PostgreSQL 表創建完成")
             logger.info("✅ PostgreSQL 資料庫初始化成功")
             
         except Exception as e:
+            print(f"❌ PostgreSQL 初始化失敗: {e}")
             logger.error(f"❌ PostgreSQL 初始化失敗: {e}")
             raise
     
     def init_sqlite(self):
         """初始化 SQLite 資料庫（回退方案）"""
         try:
+            print("🔧 創建 SQLite 資料庫...")
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
             
@@ -189,9 +239,11 @@ class DatabaseManager:
             
             conn.commit()
             conn.close()
+            print("✅ SQLite 資料庫創建完成")
             logger.info("✅ SQLite 資料庫初始化成功")
             
         except Exception as e:
+            print(f"❌ SQLite 初始化失敗: {e}")
             logger.error(f"❌ SQLite 初始化失敗: {e}")
             raise
     
@@ -367,145 +419,6 @@ class DatabaseManager:
             logger.error(f"❌ 驗證過程錯誤: {e}")
             return {'valid': False, 'error': f'驗證過程錯誤: {str(e)}'}
     
-    def revoke_serial(self, serial_key: str, reason: str = "管理員停用") -> bool:
-        """停用序號"""
-        try:
-            serial_hash = self.hash_serial(serial_key)
-            revoked_date = datetime.now()
-            
-            conn = self.get_connection()
-            cursor = conn.cursor()
-            
-            if self.use_postgresql:
-                cursor.execute('''
-                    UPDATE serials 
-                    SET is_active = FALSE, revoked_date = %s, revoked_reason = %s
-                    WHERE serial_hash = %s
-                ''', (revoked_date, reason, serial_hash))
-            else:
-                cursor.execute('''
-                    UPDATE serials 
-                    SET is_active = 0, revoked_date = ?, revoked_reason = ?
-                    WHERE serial_hash = ?
-                ''', (self._format_datetime(revoked_date), reason, serial_hash))
-            
-            success = cursor.rowcount > 0
-            conn.commit()
-            conn.close()
-            
-            if success:
-                logger.info(f"✅ 序號停用成功: {serial_hash[:8]}...")
-            
-            return success
-            
-        except Exception as e:
-            logger.error(f"❌ 停用序號失敗: {e}")
-            return False
-    
-    def restore_serial(self, serial_key: str) -> bool:
-        """恢復序號"""
-        try:
-            serial_hash = self.hash_serial(serial_key)
-            
-            conn = self.get_connection()
-            cursor = conn.cursor()
-            
-            if self.use_postgresql:
-                cursor.execute('''
-                    UPDATE serials 
-                    SET is_active = TRUE, revoked_date = NULL, revoked_reason = NULL
-                    WHERE serial_hash = %s
-                ''', (serial_hash,))
-            else:
-                cursor.execute('''
-                    UPDATE serials 
-                    SET is_active = 1, revoked_date = NULL, revoked_reason = NULL
-                    WHERE serial_hash = ?
-                ''', (serial_hash,))
-            
-            success = cursor.rowcount > 0
-            conn.commit()
-            conn.close()
-            
-            if success:
-                logger.info(f"✅ 序號恢復成功: {serial_hash[:8]}...")
-            
-            return success
-            
-        except Exception as e:
-            logger.error(f"❌ 恢復序號失敗: {e}")
-            return False
-    
-    def add_to_blacklist(self, machine_id: str, reason: str = "違規使用") -> bool:
-        """添加到黑名單"""
-        try:
-            created_date = datetime.now()
-            
-            conn = self.get_connection()
-            cursor = conn.cursor()
-            
-            if self.use_postgresql:
-                cursor.execute('''
-                    INSERT INTO blacklist 
-                    (machine_id, reason, created_date)
-                    VALUES (%s, %s, %s)
-                    ON CONFLICT (machine_id) DO UPDATE SET
-                    reason = EXCLUDED.reason,
-                    created_date = EXCLUDED.created_date
-                ''', (machine_id, reason, created_date))
-                
-                # 同時停用該機器的所有序號
-                cursor.execute('''
-                    UPDATE serials 
-                    SET is_active = FALSE, revoked_date = %s, revoked_reason = %s
-                    WHERE machine_id = %s AND is_active = TRUE
-                ''', (created_date, f"黑名單自動停用: {reason}", machine_id))
-            else:
-                cursor.execute('''
-                    INSERT OR REPLACE INTO blacklist 
-                    (machine_id, reason, created_date)
-                    VALUES (?, ?, ?)
-                ''', (machine_id, reason, self._format_datetime(created_date)))
-                
-                cursor.execute('''
-                    UPDATE serials 
-                    SET is_active = 0, revoked_date = ?, revoked_reason = ?
-                    WHERE machine_id = ? AND is_active = 1
-                ''', (self._format_datetime(created_date), f"黑名單自動停用: {reason}", machine_id))
-            
-            conn.commit()
-            conn.close()
-            logger.info(f"✅ 黑名單添加成功: {machine_id}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ 添加黑名單失敗: {e}")
-            return False
-    
-    def remove_from_blacklist(self, machine_id: str) -> bool:
-        """從黑名單移除"""
-        try:
-            conn = self.get_connection()
-            cursor = conn.cursor()
-            
-            if self.use_postgresql:
-                cursor.execute('DELETE FROM blacklist WHERE machine_id = %s', (machine_id,))
-            else:
-                cursor.execute('DELETE FROM blacklist WHERE machine_id = ?', (machine_id,))
-            
-            success = cursor.rowcount > 0
-            conn.commit()
-            conn.close()
-            
-            if success:
-                logger.info(f"✅ 黑名單移除成功: {machine_id}")
-            
-            return success
-            
-        except Exception as e:
-            logger.error(f"❌ 移除黑名單失敗: {e}")
-            return False
-    
     def get_statistics(self) -> Dict[str, Any]:
         """獲取統計資訊"""
         try:
@@ -543,12 +456,18 @@ class DatabaseManager:
                 'revoked_serials': total_serials - active_serials,
                 'blacklist_count': blacklist_count,
                 'today_validations': today_validations,
-                'database_type': 'PostgreSQL' if self.use_postgresql else 'SQLite'
+                'database_type': 'PostgreSQL' if self.use_postgresql else 'SQLite',
+                'database_url_found': bool(self.database_url),
+                'psycopg2_available': PSYCOPG2_AVAILABLE
             }
             
         except Exception as e:
             logger.error(f"❌ 獲取統計失敗: {e}")
-            return {'database_type': 'PostgreSQL' if self.use_postgresql else 'SQLite'}
+            return {
+                'database_type': 'PostgreSQL' if self.use_postgresql else 'SQLite',
+                'database_url_found': bool(self.database_url),
+                'psycopg2_available': PSYCOPG2_AVAILABLE
+            }
     
     def _log_validation(self, cursor, serial_hash: str, machine_id: str, 
                        validation_time: datetime, result: str, client_ip: str):
@@ -571,9 +490,12 @@ class DatabaseManager:
 
 # 初始化資料庫管理器
 try:
+    print("🚀 初始化資料庫管理器...")
     db_manager = DatabaseManager()
+    print("✅ 資料庫管理器初始化完成")
     logger.info("✅ 資料庫管理器初始化成功")
 except Exception as e:
+    print(f"❌ 資料庫管理器初始化失敗: {e}")
     logger.error(f"❌ 資料庫管理器初始化失敗: {e}")
     sys.exit(1)
 
@@ -594,6 +516,7 @@ def home():
             .status { padding: 15px; margin: 10px 0; border-radius: 5px; }
             .success { background: #d4edda; color: #155724; }
             .info { background: #d1ecf1; color: #0c5460; }
+            .warning { background: #fff3cd; color: #856404; }
             table { width: 100%; border-collapse: collapse; margin: 20px 0; }
             th, td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
             th { background-color: #f2f2f2; }
@@ -608,12 +531,14 @@ def home():
             </div>
             
             {% if stats.database_type == 'PostgreSQL' %}
-            <div class="status info">
+            <div class="status success">
                 🐘 <span class="db-type">PostgreSQL</span> 資料庫已連接 - 數據永久保存
             </div>
             {% else %}
-            <div class="status info">
-                🗄️ <span class="db-type">SQLite</span> 資料庫 - 建議使用 PostgreSQL 以確保數據持久性
+            <div class="status warning">
+                🗄️ <span class="db-type">SQLite</span> 資料庫 - 調試資訊：
+                <br>DATABASE_URL 找到: {{ '是' if stats.database_url_found else '否' }}
+                <br>psycopg2 可用: {{ '是' if stats.psycopg2_available else '否' }}
             </div>
             {% endif %}
             
@@ -622,6 +547,8 @@ def home():
                 <tr><th>項目</th><th>狀態</th></tr>
                 <tr><td>部署平台</td><td>Railway.app</td></tr>
                 <tr><td>資料庫類型</td><td class="db-type">{{ stats.database_type }}</td></tr>
+                <tr><td>DATABASE_URL 存在</td><td>{{ '✅ 是' if stats.database_url_found else '❌ 否' }}</td></tr>
+                <tr><td>psycopg2 可用</td><td>{{ '✅ 是' if stats.psycopg2_available else '❌ 否' }}</td></tr>
                 <tr><td>總序號數</td><td>{{ stats.total_serials }}</td></tr>
                 <tr><td>活躍序號</td><td>{{ stats.active_serials }}</td></tr>
                 <tr><td>停用序號</td><td>{{ stats.revoked_serials }}</td></tr>
@@ -652,9 +579,13 @@ def health_check():
     return jsonify({
         'status': 'healthy',
         'server': 'BOSS檢測器 Railway 驗證伺服器',
-        'version': '5.1.0',
+        'version': '5.1.1',
         'timestamp': datetime.now().isoformat(),
         'database': stats.get('database_type', 'Unknown'),
+        'debug_info': {
+            'database_url_found': stats.get('database_url_found', False),
+            'psycopg2_available': stats.get('psycopg2_available', False)
+        },
         'stats': stats
     })
 
@@ -714,98 +645,6 @@ def register_serial():
         logger.error(f"❌ 註冊API錯誤: {e}")
         return jsonify({'success': False, 'error': f'註冊失敗: {str(e)}'}), 500
 
-@app.route('/api/revoke', methods=['POST'])
-def revoke_serial():
-    """停用序號"""
-    try:
-        data = request.get_json()
-        admin_key = data.get('admin_key')
-        
-        if admin_key != db_manager.admin_key:
-            return jsonify({'success': False, 'error': '管理員認證失敗'}), 403
-        
-        serial_key = data.get('serial_key')
-        reason = data.get('reason', '管理員停用')
-        
-        success = db_manager.revoke_serial(serial_key, reason)
-        
-        return jsonify({
-            'success': success,
-            'message': '序號停用成功' if success else '序號停用失敗'
-        })
-        
-    except Exception as e:
-        logger.error(f"❌ 停用API錯誤: {e}")
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.route('/api/restore', methods=['POST'])
-def restore_serial():
-    """恢復序號"""
-    try:
-        data = request.get_json()
-        admin_key = data.get('admin_key')
-        
-        if admin_key != db_manager.admin_key:
-            return jsonify({'success': False, 'error': '管理員認證失敗'}), 403
-        
-        serial_key = data.get('serial_key')
-        success = db_manager.restore_serial(serial_key)
-        
-        return jsonify({
-            'success': success,
-            'message': '序號恢復成功' if success else '序號恢復失敗'
-        })
-        
-    except Exception as e:
-        logger.error(f"❌ 恢復API錯誤: {e}")
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.route('/api/blacklist', methods=['POST'])
-def add_blacklist():
-    """添加黑名單"""
-    try:
-        data = request.get_json()
-        admin_key = data.get('admin_key')
-        
-        if admin_key != db_manager.admin_key:
-            return jsonify({'success': False, 'error': '管理員認證失敗'}), 403
-        
-        machine_id = data.get('machine_id')
-        reason = data.get('reason', '違規使用')
-        
-        success = db_manager.add_to_blacklist(machine_id, reason)
-        
-        return jsonify({
-            'success': success,
-            'message': '黑名單添加成功' if success else '黑名單添加失敗'
-        })
-        
-    except Exception as e:
-        logger.error(f"❌ 黑名單API錯誤: {e}")
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.route('/api/blacklist/remove', methods=['POST'])
-def remove_blacklist():
-    """移除黑名單"""
-    try:
-        data = request.get_json()
-        admin_key = data.get('admin_key')
-        
-        if admin_key != db_manager.admin_key:
-            return jsonify({'success': False, 'error': '管理員認證失敗'}), 403
-        
-        machine_id = data.get('machine_id')
-        success = db_manager.remove_from_blacklist(machine_id)
-        
-        return jsonify({
-            'success': success,
-            'message': '黑名單移除成功' if success else '黑名單移除失敗'
-        })
-        
-    except Exception as e:
-        logger.error(f"❌ 移除黑名單API錯誤: {e}")
-        return jsonify({'success': False, 'error': str(e)}), 500
-
 @app.route('/api/stats')
 def get_stats():
     """獲取統計資訊"""
@@ -815,95 +654,6 @@ def get_stats():
     except Exception as e:
         logger.error(f"❌ 統計API錯誤: {e}")
         return jsonify({'error': str(e)}), 500
-
-@app.route('/api/blacklist/check', methods=['POST'])
-def check_blacklist():
-    """檢查黑名單狀態"""
-    try:
-        data = request.get_json()
-        machine_id = data.get('machine_id')
-        
-        if not machine_id:
-            return jsonify({'blacklisted': False, 'error': '缺少機器ID'}), 400
-        
-        conn = db_manager.get_connection()
-        cursor = conn.cursor()
-        
-        if db_manager.use_postgresql:
-            cursor.execute('SELECT reason, created_date FROM blacklist WHERE machine_id = %s', (machine_id,))
-        else:
-            cursor.execute('SELECT reason, created_date FROM blacklist WHERE machine_id = ?', (machine_id,))
-        
-        result = cursor.fetchone()
-        conn.close()
-        
-        if result:
-            return jsonify({
-                'blacklisted': True,
-                'info': {
-                    'reason': result[0],
-                    'created_date': db_manager._format_datetime(result[1])
-                }
-            })
-        else:
-            return jsonify({'blacklisted': False})
-            
-    except Exception as e:
-        logger.error(f"❌ 檢查黑名單API錯誤: {e}")
-        return jsonify({'blacklisted': False, 'error': str(e)}), 500
-
-@app.route('/api/serial/status', methods=['POST'])
-def check_serial_status():
-    """檢查序號狀態"""
-    try:
-        data = request.get_json()
-        admin_key = data.get('admin_key')
-        
-        if admin_key != db_manager.admin_key:
-            return jsonify({'found': False, 'error': '管理員認證失敗'}), 403
-        
-        serial_key = data.get('serial_key')
-        if not serial_key:
-            return jsonify({'found': False, 'error': '缺少序號'}), 400
-        
-        serial_hash = db_manager.hash_serial(serial_key)
-        
-        conn = db_manager.get_connection()
-        cursor = conn.cursor()
-        
-        if db_manager.use_postgresql:
-            cursor.execute('''
-                SELECT machine_id, user_name, tier, is_active, revoked_date, revoked_reason
-                FROM serials WHERE serial_hash = %s
-            ''', (serial_hash,))
-        else:
-            cursor.execute('''
-                SELECT machine_id, user_name, tier, is_active, revoked_date, revoked_reason
-                FROM serials WHERE serial_hash = ?
-            ''', (serial_hash,))
-        
-        result = cursor.fetchone()
-        conn.close()
-        
-        if result:
-            machine_id, user_name, tier, is_active, revoked_date, revoked_reason = result
-            return jsonify({
-                'found': True,
-                'is_active': bool(is_active),
-                'info': {
-                    'machine_id': machine_id,
-                    'user_name': user_name,
-                    'tier': tier,
-                    'revoked_date': db_manager._format_datetime(revoked_date) if revoked_date else None,
-                    'revoked_reason': revoked_reason
-                }
-            })
-        else:
-            return jsonify({'found': False})
-            
-    except Exception as e:
-        logger.error(f"❌ 檢查序號狀態API錯誤: {e}")
-        return jsonify({'found': False, 'error': str(e)}), 500
 
 # 錯誤處理
 @app.errorhandler(404)
@@ -919,17 +669,13 @@ def internal_error(error):
 if __name__ == '__main__':
     print("🚀 啟動 BOSS檢測器 Railway 驗證伺服器...")
     print(f"📍 資料庫類型: {'PostgreSQL' if db_manager.use_postgresql else 'SQLite'}")
+    print(f"🔍 DATABASE_URL 存在: {bool(db_manager.database_url)}")
+    print(f"🔍 psycopg2 可用: {PSYCOPG2_AVAILABLE}")
     print("📡 可用的 API 端點:")
     print("  GET  / - 首頁")
     print("  GET  /api/health - 健康檢查")
     print("  POST /api/validate - 驗證序號")
     print("  POST /api/register - 註冊序號")
-    print("  POST /api/revoke - 停用序號")
-    print("  POST /api/restore - 恢復序號")
-    print("  POST /api/blacklist - 添加黑名單")
-    print("  POST /api/blacklist/remove - 移除黑名單")
-    print("  POST /api/blacklist/check - 檢查黑名單")
-    print("  POST /api/serial/status - 檢查序號狀態")
     print("  GET  /api/stats - 獲取統計")
     print("="*50)
     
