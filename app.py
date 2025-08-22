@@ -115,14 +115,23 @@ class EnhancedDatabaseManager:
             return sqlite3.connect(self.db_path)
     
     def init_postgresql(self):
-        """初始化 PostgreSQL 資料庫"""
+        """初始化 PostgreSQL 資料庫（包含遷移邏輯）"""
         try:
             conn = self.get_connection()
             cursor = conn.cursor()
             
-            print("🔧 創建增強版 PostgreSQL 表...")
+            print("🔧 檢查並創建 PostgreSQL 表...")
             
-            # 序號表（增強版）
+            # 首先檢查現有表結構
+            cursor.execute("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name = 'serials' AND table_schema = 'public'
+            """)
+            existing_columns = [row[0] for row in cursor.fetchall()]
+            print(f"📋 現有欄位: {existing_columns}")
+            
+            # 創建基本的序號表（如果不存在）
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS serials (
                     id SERIAL PRIMARY KEY,
@@ -139,15 +148,28 @@ class EnhancedDatabaseManager:
                     revoked_date TIMESTAMP,
                     revoked_reason TEXT,
                     created_by TEXT DEFAULT 'api',
-                    encryption_type TEXT DEFAULT 'AES+XOR',
-                    force_online BOOLEAN DEFAULT FALSE,
-                    validation_token TEXT,
-                    token_expires_at TIMESTAMP,
-                    version TEXT DEFAULT '6.0.0'
+                    encryption_type TEXT DEFAULT 'AES+XOR'
                 )
             ''')
+            print("✅ 基本序號表檢查完成")
             
-            # 黑名單表
+            # 遷移邏輯：添加新欄位（如果不存在）
+            new_columns = [
+                ('force_online', 'BOOLEAN DEFAULT FALSE'),
+                ('validation_token', 'TEXT'),
+                ('token_expires_at', 'TIMESTAMP'),
+                ('version', 'TEXT DEFAULT \'6.0.0\'')
+            ]
+            
+            for column_name, column_definition in new_columns:
+                if column_name not in existing_columns:
+                    try:
+                        cursor.execute(f'ALTER TABLE serials ADD COLUMN {column_name} {column_definition}')
+                        print(f"✅ 添加欄位: {column_name}")
+                    except Exception as e:
+                        print(f"⚠️ 添加欄位 {column_name} 失敗（可能已存在）: {e}")
+            
+            # 創建其他表
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS blacklist (
                     id SERIAL PRIMARY KEY,
@@ -158,7 +180,6 @@ class EnhancedDatabaseManager:
                 )
             ''')
             
-            # 驗證日誌表
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS validation_logs (
                     id SERIAL PRIMARY KEY,
@@ -173,7 +194,6 @@ class EnhancedDatabaseManager:
                 )
             ''')
             
-            # 驗證令牌表（強制在線用）
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS validation_tokens (
                     id SERIAL PRIMARY KEY,
@@ -186,23 +206,36 @@ class EnhancedDatabaseManager:
                 )
             ''')
             
-            # 創建索引
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_serial_hash ON serials(serial_hash)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_machine_id ON serials(machine_id)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_serial_key ON serials(serial_key)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_validation_time ON validation_logs(validation_time)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_token ON validation_tokens(token)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_force_online ON serials(force_online)')
+            # 創建索引（如果不存在）
+            indexes = [
+                'CREATE INDEX IF NOT EXISTS idx_serial_hash ON serials(serial_hash)',
+                'CREATE INDEX IF NOT EXISTS idx_machine_id ON serials(machine_id)',
+                'CREATE INDEX IF NOT EXISTS idx_serial_key ON serials(serial_key)',
+                'CREATE INDEX IF NOT EXISTS idx_validation_time ON validation_logs(validation_time)',
+                'CREATE INDEX IF NOT EXISTS idx_token ON validation_tokens(token)',
+                'CREATE INDEX IF NOT EXISTS idx_force_online ON serials(force_online)'
+            ]
+            
+            for index_sql in indexes:
+                try:
+                    cursor.execute(index_sql)
+                except Exception as e:
+                    print(f"⚠️ 創建索引失敗（可能已存在）: {e}")
             
             conn.commit()
             conn.close()
-            print("✅ 增強版 PostgreSQL 表創建完成")
-            logger.info("✅ 增強版 PostgreSQL 資料庫初始化成功")
+            print("✅ PostgreSQL 資料庫遷移完成")
+            logger.info("✅ PostgreSQL 資料庫初始化和遷移成功")
             
         except Exception as e:
             print(f"❌ PostgreSQL 初始化失敗: {e}")
             logger.error(f"❌ PostgreSQL 初始化失敗: {e}")
-            raise
+            # 不要 raise，讓系統回退到 SQLite
+            self.use_postgresql = False
+            self.db_path = "boss_detector_enhanced.db"
+            logger.info("🔄 回退到 SQLite 資料庫")
+            self.init_sqlite()
+
     
     def init_sqlite(self):
         """初始化 SQLite 資料庫（回退方案）"""
@@ -1619,3 +1652,4 @@ if __name__ == '__main__':
     # 開發模式
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
+
